@@ -2,7 +2,7 @@
 import os
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("AgentCommunicationProtocol")
+mcp = FastMCP("FileProtocol")
 
 # MCP Server will have tooling for create file, edit file, overwrite file
 @mcp.tool()
