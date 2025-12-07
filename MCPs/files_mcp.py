@@ -1,5 +1,7 @@
 # Daniel Rivas 55919944
 import os
+import subprocess
+from typing import List
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("FileProtocol")
@@ -15,6 +17,25 @@ def create_file(file_name: str) -> str:
     
     # Return the file name
     return file_name
+
+@mcp.tool()
+def read_file(file_path: str) -> str:
+    """
+    Read and return file contents.
+    
+    Args:
+        file_path: Path to the file to read
+        
+    Returns:
+        str: Contents of the file
+    """
+    if not os.path.exists(file_path):
+        raise ValueError(f"File not found: {file_path}")
+    
+    with open(file_path, 'r') as f:
+        content = f.read()
+    
+    return content
 
 @mcp.tool()
 def edit_file(file_name: str, content: str) -> str:

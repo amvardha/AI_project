@@ -1,3 +1,7 @@
 FastMCP
 gradio
 pathlib
+mcp
+google-generativeai
+python-dotenv
+pylint
