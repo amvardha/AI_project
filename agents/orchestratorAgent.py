@@ -7,27 +7,31 @@ import traceback
 from typing import List, Dict, Callable
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-import google.generativeai as genai
 from dotenv import load_dotenv
 from utils.logger import get_logger
 from agents.coding_agent import CodingAgent
+
+# LangChain imports
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.prompts import PromptTemplate
+from langchain_mcp_adapters.tools import load_mcp_tools
 
 # Load environment variables
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL")
-# Configure Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
 
-class MainAgent:
+class OrchestratorAgent:
     """
     Main orchestrator agent that coordinates the entire application generation process.
+    Uses LangChain ReAct framework with MCP tools.
     """
     
     def __init__(self, status_callback: Callable[[str], None] = None):
         """
-        Initialize the main agent.
+        Initialize the orchestrator agent.
         
         Args:
             status_callback: Optional callback function to report status updates to UI
@@ -35,10 +39,15 @@ class MainAgent:
         self.status_callback = status_callback
         self.orchestrator_session = None
         self.file_session = None
-        self.model = genai.GenerativeModel(GEMINI_MODEL)
+        self.llm = ChatGoogleGenerativeAI(
+            model=GEMINI_MODEL,
+            google_api_key=GEMINI_API_KEY,
+            temperature=0.7
+        )
         self.logger = get_logger()
         self.current_status = "initialized"
         self.coding_agent = CodingAgent()
+        self.agent_executor = None
         
     def report_status(self, status: str):
         """Report status to UI if callback is provided."""
@@ -47,7 +56,7 @@ class MainAgent:
         
         # Log status change
         self.logger.log_status_change(
-            component="main_agent",
+            component="orchestrator_agent",
             old_status=old_status,
             new_status=status
         )
@@ -59,7 +68,7 @@ class MainAgent:
         """Get orchestrator MCP server parameters."""
         return StdioServerParameters(
             command="python",
-            args=[os.getenv("ORCHESTRATOR_MCP_PATH", "../MCPs/orchestrator_mcp.py")],
+            args=[os.getenv("ORCHESTRATOR_MCP_PATH", "run_mcp_servers.py"), "orchestrator"],
             env=None
         )
     
@@ -67,8 +76,54 @@ class MainAgent:
         """Get file MCP server parameters."""
         return StdioServerParameters(
             command="python",
-            args=[os.getenv("FILE_MCP_PATH", "../MCPs/files_mcp.py")],
+            args=[os.getenv("FILE_MCP_PATH", "run_mcp_servers.py"), "file"],
             env=None
+        )
+    
+    async def setup_agent(self):
+        """Setup the LangChain ReAct agent with MCP tools."""
+        # Load MCP tools from running servers
+        orchestrator_tools = await load_mcp_tools(self.orchestrator_session)
+        
+        # Create ReAct prompt template
+        react_prompt = PromptTemplate.from_template(
+            """You are an orchestrator agent coordinating application generation.
+You have access to tools for managing tasks and reading requirements.
+
+Available tools:
+{tools}
+
+Tool names: {tool_names}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Question: {input}
+
+{agent_scratchpad}"""
+        )
+        
+        # Create ReAct agent
+        agent = create_react_agent(
+            llm=self.llm,
+            tools=orchestrator_tools,
+            prompt=react_prompt
+        )
+        
+        self.agent_executor = AgentExecutor(
+            agent=agent,
+            tools=orchestrator_tools,
+            verbose=True,
+            max_iterations=10,
+            handle_parsing_errors=True
         )
     
     async def parse_requirements(self, requirements_file: str) -> str:
@@ -114,18 +169,21 @@ class MainAgent:
         
         # Track LLM call
         start_time = time.time()
-        response = self.model.generate_content(prompt)
+        response = self.llm.invoke(prompt)
         response_time = time.time() - start_time
         
-        # Estimate token counts (Gemini doesn't provide exact counts in response)
-        prompt_tokens = len(prompt.split()) * 1.3  # Rough estimate
-        completion_tokens = len(response.text.split()) * 1.3
+        # Get response content
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        
+        # Estimate token counts
+        prompt_tokens = len(prompt.split()) * 1.3
+        completion_tokens = len(response_text.split()) * 1.3
         total_tokens = int(prompt_tokens + completion_tokens)
         
-        # Log LLM call (Gemini Pro pricing: ~$0.00025 per 1K tokens for input, $0.0005 per 1K tokens for output)
+        # Log LLM call
         cost_estimate = (prompt_tokens / 1000 * 0.00025) + (completion_tokens / 1000 * 0.0005)
         self.logger.log_llm_call(
-            agent="main_agent",
+            agent="orchestrator_agent",
             purpose="task_breakdown",
             model=GEMINI_MODEL,
             prompt_tokens=int(prompt_tokens),
@@ -135,7 +193,7 @@ class MainAgent:
             cost_estimate=cost_estimate
         )
         
-        tasks_json = response.text.strip()
+        tasks_json = response_text.strip()
         
         # Extract JSON from markdown code blocks if present
         if "```json" in tasks_json:
@@ -144,8 +202,6 @@ class MainAgent:
             tasks_json = tasks_json.split("```")[1].split("```")[0].strip()
         
         tasks = json.loads(tasks_json)
-
-        self.logger.info(f"Tasks: {tasks}")
         
         # Ensure all tasks have required fields
         for task in tasks:
@@ -281,43 +337,52 @@ class MainAgent:
         # Run tests with requirements validation
         results = await testing_agent.run_tests(tasks, project_path, requirements)
         
-        # Update task statuses based on test results
-        for task_id, test_result in results.items():
-            if test_result["passed"]:
-                self.logger.log_status_change(
-                    component="task",
-                    old_status="testing required",
-                    new_status="completed",
-                    task_id=task_id
-                )
-                
-                await self.orchestrator_session.call_tool(
-                    "update_task_status",
-                    arguments={
-                        "task_id": task_id,
-                        "status": "completed",
-                        "result": test_result["message"],
-                        "errors": None
-                    }
-                )
+        # Determine overall success from the global results
+        overall_passed = True
+        failure_reason = ""
+        
+        # Check for execution errors
+        if "error" in results:
+            overall_passed = False
+            failure_reason = results["error"]
+        # Check requirements validation if present
+        elif "requirements_validation" in results and not results["requirements_validation"].get("validated", False):
+            overall_passed = False
+            failure_reason = results["requirements_validation"].get("message", "Requirements validation failed")
+            if "errors" in results["requirements_validation"]:
+                failure_reason += f": {', '.join(results['requirements_validation']['errors'])}"
+        
+        # Update ALL tasks since we are doing project-level validation
+        for task in tasks:
+            task_id = task["id"]
+            
+            if overall_passed:
+                new_status = "completed"
+                result_msg = "Project tests generated and requirements validated."
+                errors = None
             else:
-                self.logger.log_status_change(
-                    component="task",
-                    old_status="testing required",
-                    new_status="error",
-                    task_id=task_id,
-                    details={"errors": test_result.get("errors", [])}
-                )
-                
-                await self.orchestrator_session.call_tool(
-                    "update_task_status",
-                    arguments={
-                        "task_id": task_id,
-                        "status": "error",
-                        "result": test_result["message"],
-                        "errors": test_result.get("errors", [])
-                    }
-                )
+                new_status = "error"
+                result_msg = f"Testing/Validation failed: {failure_reason}"
+                errors = [failure_reason]
+            
+            # Log status change
+            self.logger.log_status_change(
+                component="task",
+                old_status=task.get("status", "unknown"),
+                new_status=new_status,
+                task_id=task_id
+            )
+            
+            # Update status in orchestrator
+            await self.orchestrator_session.call_tool(
+                "update_task_status",
+                arguments={
+                    "task_id": task_id,
+                    "status": new_status,
+                    "result": result_msg,
+                    "errors": errors
+                }
+            )
         
         return results
     
@@ -345,6 +410,9 @@ class MainAgent:
                         await orchestrator_session.initialize()
                         await file_session.initialize()
                         
+                        # Setup LangChain ReAct agent
+                        await self.setup_agent()
+                        
                         try:
                             # Step 1: Parse requirements
                             self.report_status("Planning")
@@ -352,13 +420,20 @@ class MainAgent:
                             
                             # Step 2: Break down into tasks
                             tasks = await self.break_down_tasks(requirements)
+
+                            with open("tasks.txt", "w") as f:
+                                f.write(requirements)
+                                f.write("\n\nTasks:\n")
+                                for i, task in enumerate(tasks):
+                                    f.write(f"Task {i+1}: {task['description']}")
+                                    f.write("\n")
                             
                             # Step 3: Initialize tasks in orchestrator
                             await self.set_tasks_in_orchestrator(tasks)
                             
                             # Step 4: Execute tasks sequentially
                             self.report_status("Coding")
-                            max_retries = 1
+                            max_retries = 2
                             
                             for task in tasks:
                                 retries = 0
@@ -378,7 +453,7 @@ class MainAgent:
                             
                             # Step 5: Run testing with requirements validation
                             self.report_status("Testing")
-                            test_results = await self.run_testing_agent(project_path, requirements)
+                            test_results = await self.run_testing_agent(project_path)
                             
                             # Step 6: Final status
                             self.report_status("Completed")
@@ -400,7 +475,7 @@ class MainAgent:
                         except Exception as e:
                             self.report_status("Error")
                             self.logger.log_error(
-                                component="main_agent",
+                                component="orchestrator_agent",
                                 error_type="execution_error",
                                 error_message=str(e),
                                 stack_trace=traceback.format_exc()
@@ -417,8 +492,8 @@ class MainAgent:
 
 
 async def main():
-    """Test the main agent."""
-    agent = MainAgent(status_callback=lambda s: print(f"Status: {s}"))
+    """Test the orchestrator agent."""
+    agent = OrchestratorAgent(status_callback=lambda s: print(f"Status: {s}"))
     
     # Create a test requirements file
     test_req_file = "/tmp/test_requirements.txt"

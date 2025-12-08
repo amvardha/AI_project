@@ -7,7 +7,7 @@ import tempfile
 import gradio as gr
 from pathlib import Path
 
-from agents.main_agent import MainAgent
+from agents.orchestratorAgent import OrchestratorAgent
 from utils.logger import reset_logger
 
 # Color mapping for different statuses
@@ -73,11 +73,17 @@ def generate_app(description, requirements, uploaded_file):
     
     # Create a temporary directory for the generated project
     project_name = "generated_project"
-    output_dir = os.path.join(tempfile.gettempdir(), project_name)
+    unique_project_name = project_name
+    counter = 1
+    while os.path.exists(os.path.join(tempfile.gettempdir(), unique_project_name)):
+        unique_project_name = f"{project_name}_{counter}"
+        counter += 1
+
+    output_dir = os.path.join(tempfile.gettempdir(), unique_project_name)
     os.makedirs(output_dir, exist_ok=True)
     
     # Create requirements file from inputs
-    requirements_file = os.path.join(tempfile.gettempdir(), "requirements.txt")
+    requirements_file = os.path.join(tempfile.gettempdir(), "project_requirements.txt")
     
     if uploaded_file is not None:
         # Use uploaded file
@@ -95,8 +101,8 @@ def generate_app(description, requirements, uploaded_file):
     def status_callback(status):
         current_status["value"] = status
     
-    # Create and run main agent
-    agent = MainAgent(status_callback=status_callback)
+    # Create and run orchestrator agent
+    agent = OrchestratorAgent(status_callback=status_callback)
     
     # Run agent in async context
     async def run_agent():
@@ -131,47 +137,40 @@ def generate_app(description, requirements, uploaded_file):
         raise thread_result['error']
         
     result = thread_result.get('data')
+    
+    if result.get("success"):
+        # Create a zip file of the project
+        zip_path = os.path.join(tempfile.gettempdir(), f"{project_name}.zip")
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(output_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, output_dir)
+                    zipf.write(file_path, arcname)
         
-        if result.get("success"):
-            # Create a zip file of the project
-            zip_path = os.path.join(tempfile.gettempdir(), f"{project_name}.zip")
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(output_dir):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, output_dir)
-                        zipf.write(file_path, arcname)
-            
-            # Final status update with zip file
-            final_status_html = get_status_html("Completed")
-            
-            # Generate log summary
-            log_summary = ""
-            if "log_summary" in result:
-                from utils.logger import get_logger
-                logger = get_logger()
-                log_summary = logger.get_formatted_summary()
-            
-            yield final_status_html, output_dir, zip_path, log_summary
-        else:
-            # Error occurred
-            error_status_html = get_status_html("Error")
-            
-            # Generate log summary even on error
-            log_summary = ""
-            if "log_summary" in result:
-                from utils.logger import get_logger
-                logger = get_logger()
-                log_summary = logger.get_formatted_summary()
-            
-            yield error_status_html, output_dir, None, log_summary
-    
-    except Exception as e:
+        # Final status update with zip file
+        final_status_html = get_status_html("Completed")
+        
+        # Generate log summary
+        log_summary = ""
+        if "log_summary" in result:
+            from utils.logger import get_logger
+            logger = get_logger()
+            log_summary = logger.get_formatted_summary()
+        
+        yield final_status_html, output_dir, zip_path, log_summary
+    else:
+        # Error occurred
         error_status_html = get_status_html("Error")
-        yield error_status_html, f"Error: {str(e)}", None, ""
-    
-    finally:
-        loop.close()
+        
+        # Generate log summary even on error
+        log_summary = ""
+        if "log_summary" in result:
+            from utils.logger import get_logger
+            logger = get_logger()
+            log_summary = logger.get_formatted_summary()
+        
+        yield error_status_html, output_dir, None, log_summary
 
 
 # Pre-filled software description for QuickDelivery

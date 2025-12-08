@@ -5,3 +5,6 @@ mcp
 google-generativeai
 python-dotenv
 pylint
+langchain
+langchain-google-genai
+langchain-mcp-adapters

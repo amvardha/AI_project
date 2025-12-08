@@ -7,44 +7,90 @@ import traceback
 from typing import Tuple, List
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-import google.generativeai as genai
 from dotenv import load_dotenv
 from utils.logger import get_logger
+
+# LangChain imports
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.prompts import PromptTemplate
+from langchain_mcp_adapters.tools import load_mcp_tools
 
 # Load environment variables
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL")
-# Configure Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
 
 class CodingAgent:
     """
     Coding agent that generates code for assigned tasks.
+    Uses LangChain ReAct framework with MCP tools.
     """
     
     def __init__(self):
         """Initialize the coding agent."""
-        self.orchestrator_session = None
         self.file_session = None
-        self.model = genai.GenerativeModel(GEMINI_MODEL)
-        self.logger = get_logger()
-    
-    def _get_orchestrator_params(self):
-        """Get orchestrator MCP server parameters."""
-        return StdioServerParameters(
-            command="python",
-            args=[os.getenv("ORCHESTRATOR_MCP_PATH", "../MCPs/orchestrator_mcp.py")],
-            env=None
+        self.llm = ChatGoogleGenerativeAI(
+            model=GEMINI_MODEL,
+            google_api_key=GEMINI_API_KEY,
+            temperature=0.7
         )
+        self.logger = get_logger()
+        self.agent_executor = None
     
     def _get_file_params(self):
         """Get file MCP server parameters."""
         return StdioServerParameters(
             command="python",
-            args=[os.getenv("FILE_MCP_PATH", "../MCPs/files_mcp.py")],
+            args=[os.getenv("FILE_MCP_PATH", "run_mcp_servers.py"), "file"],
             env=None
+        )
+    
+    async def setup_agent(self):
+        """Setup the LangChain ReAct agent with MCP tools."""
+        # Load MCP tools from running file server
+        file_tools = await load_mcp_tools(self.file_session)
+        
+        # Create ReAct prompt template
+        react_prompt = PromptTemplate.from_template(
+            """You are a coding agent that generates code for tasks.
+You have access to file manipulation tools.
+
+Available tools:
+{tools}
+
+Tool names: {tool_names}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Question: {input}
+
+{agent_scratchpad}"""
+        )
+        
+        # Create ReAct agent
+        agent = create_react_agent(
+            llm=self.llm,
+            tools=file_tools,
+            prompt=react_prompt
+        )
+        
+        self.agent_executor = AgentExecutor(
+            agent=agent,
+            tools=file_tools,
+            verbose=True,
+            max_iterations=15,
+            handle_parsing_errors=True
         )
     
     async def generate_code(self, task_description: str, project_path: str, errors: List[str] = []) -> Tuple[bool, str, List[str]]:
@@ -54,6 +100,7 @@ class CodingAgent:
         Args:
             task_description: Description of the task
             project_path: Path to the project directory
+            errors: Previous errors if retrying
             
         Returns:
             Tuple of (success, result_message, errors)
@@ -84,12 +131,15 @@ class CodingAgent:
             
             # Track LLM call
             start_time = time.time()
-            response = self.model.generate_content(prompt)
+            response = self.llm.invoke(prompt)
             response_time = time.time() - start_time
+            
+            # Get response content
+            response_text = response.content if hasattr(response, 'content') else str(response)
             
             # Estimate token counts
             prompt_tokens = len(prompt.split()) * 1.3
-            completion_tokens = len(response.text.split()) * 1.3
+            completion_tokens = len(response_text.split()) * 1.3
             total_tokens = int(prompt_tokens + completion_tokens)
             
             # Log LLM call
@@ -105,15 +155,26 @@ class CodingAgent:
                 cost_estimate=cost_estimate
             )
             
-            response_text = response.text.strip()
-            
             # Extract JSON from markdown code blocks if present
+            # Clean up response text before parsing
             if "```json" in response_text:
                 response_text = response_text.split("```json")[1].split("```")[0].strip()
             elif "```" in response_text:
                 response_text = response_text.split("```")[1].split("```")[0].strip()
             
-            code_plan = json.loads(response_text)
+            # Remove any potential control characters that might break JSON parsing
+            response_text = response_text.replace('\x00', '').replace('\x1f', '')
+            
+            try:
+                code_plan = json.loads(response_text)
+            except json.JSONDecodeError as e:
+                # Log the failing JSON for debugging
+                self.logger.log_error("coding_agent", "json_parse_error", f"Failed to parse JSON: {str(e)}. Raw text: {response_text[:500]}...")
+                # Attempt to salvage if it's just an unterminated string (common with long responses)
+                if "Unterminated string" in str(e):
+                     # Try to close the JSON structure artificially if possible, or just fail gracefully
+                     pass
+                raise ValueError(f"Error generating code: {str(e)}")
             
             # Create files using file MCP
             created_files = []
@@ -164,6 +225,9 @@ class CodingAgent:
                 
                 # Initialize the session to ensure it's ready
                 await file_session.initialize()
+                
+                # Setup LangChain ReAct agent
+                await self.setup_agent()
                 
                 return await self.generate_code(task["description"], project_path, task.get("errors", []))
 
