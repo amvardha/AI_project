@@ -83,6 +83,7 @@ class SystemLogger:
             log_msg += f" (Task: {task_id})"
         log_msg += f" {old_status} -> {new_status}"
         
+        print(f"INFO: {log_msg}")
         self.logger.info(log_msg)
         self._save_logs()
     
@@ -128,6 +129,7 @@ class SystemLogger:
         if cost_estimate:
             log_msg += f" | Cost: ${cost_estimate:.4f}"
         
+        print(f"INFO: {log_msg}")
         self.logger.info(log_msg)
         self._save_logs()
     
@@ -155,7 +157,13 @@ class SystemLogger:
         self.logs["errors"].append(event)
         
         log_msg = f"Error in {component}: {error_type} - {error_message}"
+        print(f"ERROR: {log_msg}")
         self.logger.error(log_msg)
+        self._save_logs()
+
+    def info(self, log_msg: str):
+        print(f"INFO: {log_msg}")
+        self.logger.info(log_msg)
         self._save_logs()
     
     def generate_summary(self) -> Dict:
@@ -308,11 +316,13 @@ class SystemLogger:
     
     def _save_logs(self):
         """Save logs to JSON file."""
-        with open(self.log_file, 'w') as f:
+        print(f"Saving logs to {self.log_file}")
+        with open(self.log_file, 'a') as f:
             json.dump(self.logs, f, indent=2)
     
     def get_log_file_path(self) -> str:
         """Get the path to the current log file."""
+        print(f"Current log file: {self.log_file}")
         return self.log_file
 
 

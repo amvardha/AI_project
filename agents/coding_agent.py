@@ -3,6 +3,7 @@ import os
 import json
 import asyncio
 import time
+import traceback
 from typing import Tuple, List
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -30,38 +31,21 @@ class CodingAgent:
         self.model = genai.GenerativeModel(GEMINI_MODEL)
         self.logger = get_logger()
     
-    async def connect_to_mcps(self):
-        """Connect to orchestrator and file MCP servers."""
-        # Connect to orchestrator MCP
-        orchestrator_params = StdioServerParameters(
+    def _get_orchestrator_params(self):
+        """Get orchestrator MCP server parameters."""
+        return StdioServerParameters(
             command="python",
             args=[os.getenv("ORCHESTRATOR_MCP_PATH", "../MCPs/orchestrator_mcp.py")],
             env=None
         )
-        
-        # Connect to file MCP
-        file_params = StdioServerParameters(
+    
+    def _get_file_params(self):
+        """Get file MCP server parameters."""
+        return StdioServerParameters(
             command="python",
             args=[os.getenv("FILE_MCP_PATH", "../MCPs/files_mcp.py")],
             env=None
         )
-        
-        # Create sessions
-        self.orchestrator_read, self.orchestrator_write = await stdio_client(orchestrator_params)
-        self.file_read, self.file_write = await stdio_client(file_params)
-        
-        self.orchestrator_session = ClientSession(self.orchestrator_read, self.orchestrator_write)
-        self.file_session = ClientSession(self.file_read, self.file_write)
-        
-        await self.orchestrator_session.__aenter__()
-        await self.file_session.__aenter__()
-    
-    async def disconnect_from_mcps(self):
-        """Disconnect from MCP servers."""
-        if self.orchestrator_session:
-            await self.orchestrator_session.__aexit__(None, None, None)
-        if self.file_session:
-            await self.file_session.__aexit__(None, None, None)
     
     async def generate_code(self, task_description: str, project_path: str, errors: List[str] = []) -> Tuple[bool, str, List[str]]:
         """
@@ -113,7 +97,7 @@ class CodingAgent:
             self.logger.log_llm_call(
                 agent="coding_agent",
                 purpose="code_generation",
-                model="gemini-pro",
+                model=GEMINI_MODEL,
                 prompt_tokens=int(prompt_tokens),
                 completion_tokens=int(completion_tokens),
                 total_tokens=total_tokens,
@@ -157,7 +141,8 @@ class CodingAgent:
             self.logger.log_error(
                 component="coding_agent",
                 error_type="code_generation_error",
-                error_message=error_message
+                error_message=error_message,
+                stack_trace=traceback.format_exc()
             )
             return False, error_message, [str(e)]
     
@@ -172,29 +157,32 @@ class CodingAgent:
         Returns:
             Tuple of (success, result, errors)
         """
-        return await self.generate_code(task["description"], project_path, task["errors"])
+        # Use async with to properly manage MCP connections
+        async with stdio_client(self._get_file_params()) as (file_read, file_write):
+            async with ClientSession(file_read, file_write) as file_session:
+                self.file_session = file_session
+                
+                # Initialize the session to ensure it's ready
+                await file_session.initialize()
+                
+                return await self.generate_code(task["description"], project_path, task.get("errors", []))
 
 
 async def main():
     """Test the coding agent."""
     agent = CodingAgent()
-    await agent.connect_to_mcps()
     
-    try:
-        task = {
-            "id": "test_1",
-            "description": "Create a simple Python hello world script",
-            "status": "pending",
-            "assigned_to": "coding_agent"
-        }
-        
-        success, result, errors = await agent.execute_task(task, "/tmp/test_coding")
-        print(f"Success: {success}")
-        print(f"Result: {result}")
-        print(f"Errors: {errors}")
+    task = {
+        "id": "test_1",
+        "description": "Create a simple Python hello world script",
+        "status": "pending",
+        "assigned_to": "coding_agent"
+    }
     
-    finally:
-        await agent.disconnect_from_mcps()
+    success, result, errors = await agent.execute_task(task, "/tmp/test_coding")
+    print(f"Success: {success}")
+    print(f"Result: {result}")
+    print(f"Errors: {errors}")
 
 
 if __name__ == "__main__":

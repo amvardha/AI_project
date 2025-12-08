@@ -101,23 +101,36 @@ def generate_app(description, requirements, uploaded_file):
     # Run agent in async context
     async def run_agent():
         return await agent.run(requirements_file, output_dir)
+        
+    # Container for thread result
+    thread_result = {}
     
-    # Execute agent and yield status updates
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # Start agent in background
-    task = loop.create_task(run_agent())
+    def run_in_thread():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            thread_result['data'] = loop.run_until_complete(run_agent())
+        except Exception as e:
+            thread_result['error'] = e
+        finally:
+            loop.close()
+            
+    # Start agent in background thread
+    import threading
+    agent_thread = threading.Thread(target=run_in_thread)
+    agent_thread.start()
     
     # Poll for status updates
-    while not task.done():
+    while agent_thread.is_alive():
         status_html = get_status_html(current_status["value"])
         yield status_html, output_dir, None, ""
         time.sleep(1)
-    
+        
     # Get final result
-    try:
-        result = task.result()
+    if 'error' in thread_result:
+        raise thread_result['error']
+        
+    result = thread_result.get('data')
         
         if result.get("success"):
             # Create a zip file of the project

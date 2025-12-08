@@ -31,38 +31,21 @@ class TestingAgent:
         self.model = genai.GenerativeModel(GEMINI_MODEL)
         self.logger = get_logger()
     
-    async def connect_to_mcps(self):
-        """Connect to orchestrator and file MCP servers."""
-        # Connect to orchestrator MCP
-        orchestrator_params = StdioServerParameters(
+    def _get_orchestrator_params(self):
+        """Get orchestrator MCP server parameters."""
+        return StdioServerParameters(
             command="python",
             args=[os.getenv("ORCHESTRATOR_MCP_PATH", "../MCPs/orchestrator_mcp.py")],
             env=None
         )
-        
-        # Connect to file MCP
-        file_params = StdioServerParameters(
+    
+    def _get_file_params(self):
+        """Get file MCP server parameters."""
+        return StdioServerParameters(
             command="python",
             args=[os.getenv("FILE_MCP_PATH", "../MCPs/files_mcp.py")],
             env=None
         )
-        
-        # Create sessions
-        self.orchestrator_read, self.orchestrator_write = await stdio_client(orchestrator_params)
-        self.file_read, self.file_write = await stdio_client(file_params)
-        
-        self.orchestrator_session = ClientSession(self.orchestrator_read, self.orchestrator_write)
-        self.file_session = ClientSession(self.file_read, self.file_write)
-        
-        await self.orchestrator_session.__aenter__()
-        await self.file_session.__aenter__()
-    
-    async def disconnect_from_mcps(self):
-        """Disconnect from MCP servers."""
-        if self.orchestrator_session:
-            await self.orchestrator_session.__aexit__(None, None, None)
-        if self.file_session:
-            await self.file_session.__aexit__(None, None, None)
     
     def run_lint_check(self, file_path: str) -> Dict:
         """
@@ -150,7 +133,7 @@ class TestingAgent:
             self.logger.log_llm_call(
                 agent="testing_agent",
                 purpose="test_generation",
-                model="gemini-pro",
+                model=GEMINI_MODEL,
                 prompt_tokens=int(prompt_tokens),
                 completion_tokens=int(completion_tokens),
                 total_tokens=total_tokens,
@@ -185,112 +168,263 @@ class TestingAgent:
             )
             return f"# Error generating tests: {str(e)}"
     
-    async def run_tests(self, tasks: List[Dict], project_path: str) -> Dict[str, Dict]:
+    async def validate_requirements(self, task_description: str, requirements: str, file_contents: Dict[str, str]) -> Dict:
+        """
+        Validate that generated code fulfills the original requirements.
+        
+        Args:
+            task_description: Description of the task
+            requirements: Original requirements text
+            file_contents: Dictionary mapping file paths to their contents
+            
+        Returns:
+            Dict with validation results:
+                - validated: true or false
+                - message: string explanation
+                - errors: list of issues found
+        """
+        try:
+            # Build file contents summary
+            files_summary = "\n\n".join([
+                f"File: {path}\n```\n{content}\n```"
+                for path, content in file_contents.items()
+            ])
+            
+            prompt = f"""
+            You are a requirements validation expert. Your task is to determine if the generated code fulfills the original requirements.
+            
+            ORIGINAL REQUIREMENTS:
+            {requirements}
+            
+            TASK DESCRIPTION:
+            {task_description}
+            
+            GENERATED CODE:
+            {files_summary}
+            
+            Analyze whether the generated code fulfills the requirements for this specific task.
+            
+            Respond in the following JSON format:
+            {{
+                "validated": true or false,
+                "message": "Brief explanation of whether requirements are met",
+                "errors": ["list of specific issues if any, empty array if validated is true"]
+            }}
+            
+            Return ONLY valid JSON, nothing else.
+            """
+            
+            # Track LLM call
+            start_time = time.time()
+            response = self.model.generate_content(prompt)
+            response_time = time.time() - start_time
+            
+            # Estimate token counts
+            prompt_tokens = len(prompt.split()) * 1.3
+            completion_tokens = len(response.text.split()) * 1.3
+            total_tokens = int(prompt_tokens + completion_tokens)
+            
+            # Log LLM call
+            cost_estimate = (prompt_tokens / 1000 * 0.00025) + (completion_tokens / 1000 * 0.0005)
+            self.logger.log_llm_call(
+                agent="testing_agent",
+                purpose="requirements_validation",
+                model=GEMINI_MODEL,
+                prompt_tokens=int(prompt_tokens),
+                completion_tokens=int(completion_tokens),
+                total_tokens=total_tokens,
+                response_time=response_time,
+                cost_estimate=cost_estimate
+            )
+            
+            response_text = response.text.strip()
+            
+            # Extract JSON from markdown code blocks if present
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+            validation_result = json.loads(response_text)
+            
+            # Ensure all required fields are present
+            if "validated" not in validation_result:
+                validation_result["validated"] = False
+            if "message" not in validation_result:
+                validation_result["message"] = "Validation result incomplete"
+            if "errors" not in validation_result:
+                validation_result["errors"] = []
+            
+            return validation_result
+        
+        except Exception as e:
+            self.logger.log_error(
+                component="testing_agent",
+                error_type="requirements_validation_error",
+                error_message=str(e)
+            )
+            return {
+                "validated": False,
+                "message": f"Error validating requirements: {str(e)}",
+                "errors": [str(e)]
+            }
+    
+    async def run_tests(self, tasks: List[Dict], project_path: str, requirements: str = "") -> Dict[str, Dict]:
         """
         Run tests on all completed tasks.
         
         Args:
             tasks: List of task dictionaries
             project_path: Path to the project directory
+            requirements: Original requirements text for validation (optional)
             
         Returns:
             Dict mapping task_id to test results
         """
-        results = {}
-        
-        for task in tasks:
-            if task["status"] not in ["testing required", "completed"]:
-                continue
-            
-            task_id = task["id"]
-            task_result = {
-                "passed": True,
-                "message": "",
-                "errors": []
-            }
-            
-            # Get list of files from task result
-            # For now, we'll scan the project directory for Python files
-            python_files = []
-            for root, dirs, files in os.walk(project_path):
-                for file in files:
-                    if file.endswith('.py'):
-                        python_files.append(os.path.join(root, file))
-            
-            # Run lint checks on each file
-            all_lint_errors = []
-            for file_path in python_files:
-                lint_result = self.run_lint_check(file_path)
-                if not lint_result["passed"]:
-                    all_lint_errors.extend(lint_result["errors"])
-            
-            # Generate and save test cases
-            test_files_created = []
-            for file_path in python_files:
-                if file_path.endswith('_test.py') or file_path.endswith('test_.py'):
-                    continue  # Skip existing test files
+        # Use async with to properly manage MCP connections
+        async with stdio_client(self._get_file_params()) as (file_read, file_write):
+            async with ClientSession(file_read, file_write) as file_session:
+                self.file_session = file_session
                 
-                try:
-                    # Read file content
-                    result = await self.file_session.call_tool(
-                        "read_file",
-                        arguments={"file_path": file_path}
-                    )
-                    code_content = result.content[0].text
-                    
-                    # Generate test cases
-                    test_code = await self.generate_test_cases(file_path, code_content)
-                    
-                    # Save test file
-                    test_file_path = file_path.replace('.py', '_test.py')
-                    await self.file_session.call_tool(
-                        "edit_file",
-                        arguments={
-                            "file_name": test_file_path,
-                            "content": test_code
-                        }
-                    )
-                    test_files_created.append(test_file_path)
+                # Initialize the session to ensure it's ready
+                await file_session.initialize()
                 
-                except Exception as e:
-                    all_lint_errors.append(f"Error generating tests for {file_path}: {str(e)}")
-            
-            # Compile results
-            if all_lint_errors:
-                task_result["passed"] = False
-                task_result["errors"] = all_lint_errors
-                task_result["message"] = f"Found {len(all_lint_errors)} issues. Test files created: {len(test_files_created)}"
-            else:
-                task_result["passed"] = True
-                task_result["message"] = f"All checks passed. Test files created: {len(test_files_created)}"
-            
-            results[task_id] = task_result
-        
-        return results
+                results = {}
+                
+                for task in tasks:
+                    if task["status"] not in ["testing required", "completed"]:
+                        continue
+                    
+                    task_id = task["id"]
+                    task_result = {
+                        "passed": True,
+                        "message": "",
+                        "errors": [],
+                        "requirements_validated": False,
+                        "requirements_validation_message": "",
+                        "requirements_validation_errors": []
+                    }
+                    
+                    # Get list of files from task result
+                    # For now, we'll scan the project directory for Python files
+                    python_files = []
+                    for root, dirs, files in os.walk(project_path):
+                        for file in files:
+                            if file.endswith('.py'):
+                                python_files.append(os.path.join(root, file))
+                    
+                    # Run lint checks on each file
+                    all_lint_errors = []
+                    for file_path in python_files:
+                        lint_result = self.run_lint_check(file_path)
+                        if not lint_result["passed"]:
+                            all_lint_errors.extend(lint_result["errors"])
+                    
+                    # Generate and save test cases
+                    test_files_created = []
+                    for file_path in python_files:
+                        if file_path.endswith('_test.py') or file_path.endswith('test_.py'):
+                            continue  # Skip existing test files
+                        
+                        try:
+                            # Read file content
+                            result = await self.file_session.call_tool(
+                                "read_file",
+                                arguments={"file_path": file_path}
+                            )
+                            code_content = result.content[0].text
+                            
+                            # Generate test cases
+                            test_code = await self.generate_test_cases(file_path, code_content)
+                            
+                            # Save test file
+                            test_file_path = file_path.replace('.py', '_test.py')
+                            await self.file_session.call_tool(
+                                "edit_file",
+                                arguments={
+                                    "file_name": test_file_path,
+                                    "content": test_code
+                                }
+                            )
+                            test_files_created.append(test_file_path)
+                        
+                        except Exception as e:
+                            all_lint_errors.append(f"Error generating tests for {file_path}: {str(e)}")
+                    
+                    # Validate requirements if provided
+                    if requirements:
+                        try:
+                            # Read all generated files for this task
+                            all_files = []
+                            for root, dirs, files in os.walk(project_path):
+                                for file in files:
+                                    all_files.append(os.path.join(root, file))
+                            
+                            # Read file contents
+                            file_contents = {}
+                            for file_path in all_files:
+                                if not file_path.endswith('_test.py'):
+                                    try:
+                                        result = await self.file_session.call_tool(
+                                            "read_file",
+                                            arguments={"file_path": file_path}
+                                        )
+                                        file_contents[file_path] = result.content[0].text
+                                    except Exception:
+                                        # Skip files that can't be read
+                                        pass
+                            
+                            # Validate requirements
+                            validation_result = await self.validate_requirements(
+                                task["description"],
+                                requirements,
+                                file_contents
+                            )
+                            
+                            task_result["requirements_validated"] = validation_result["validated"]
+                            task_result["requirements_validation_message"] = validation_result["message"]
+                            task_result["requirements_validation_errors"] = validation_result["errors"]
+                            
+                            # Update overall pass/fail based on requirements validation
+                            if not validation_result["validated"]:
+                                task_result["passed"] = False
+                                all_lint_errors.extend(validation_result["errors"])
+                        
+                        except Exception as e:
+                            task_result["requirements_validation_message"] = f"Error during validation: {str(e)}"
+                            task_result["requirements_validation_errors"] = [str(e)]
+                    
+                    # Compile results
+                    if all_lint_errors:
+                        task_result["passed"] = False
+                        task_result["errors"] = all_lint_errors
+                        task_result["message"] = f"Found {len(all_lint_errors)} issues. Test files created: {len(test_files_created)}"
+                    else:
+                        task_result["passed"] = True
+                        task_result["message"] = f"All checks passed. Test files created: {len(test_files_created)}"
+                    
+                    results[task_id] = task_result
+                
+                return results
 
 
 async def main():
     """Test the testing agent."""
     agent = TestingAgent()
-    await agent.connect_to_mcps()
     
-    try:
-        tasks = [
-            {
-                "id": "test_1",
-                "description": "Test task",
-                "status": "testing required",
-                "assigned_to": "coding_agent",
-                "result": "",
-                "errors": []
-            }
-        ]
-        
-        results = await agent.run_tests(tasks, "/tmp/test_project")
-        print(json.dumps(results, indent=2))
+    tasks = [
+        {
+            "id": "test_1",
+            "description": "Test task",
+            "status": "testing required",
+            "assigned_to": "coding_agent",
+            "result": "",
+            "errors": []
+        }
+    ]
     
-    finally:
-        await agent.disconnect_from_mcps()
+    results = await agent.run_tests(tasks, "/tmp/test_project")
+    print(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":

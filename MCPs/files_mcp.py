@@ -112,12 +112,5 @@ def lint_file(file_name: str, start: int, end: int, content: str) -> str:
     return file_name
 
 if __name__ == "__main__":
-    # Test the linting functionality
-    test_file = "lint_test.txt"
-    create_file(test_file)
-    # File must have content to be linted (lint_file checks for empty file and valid line indices)
-    overwrite_file(test_file, "Line 1\nLine 2\n")
-    lint_file(test_file, 0, 1, "Modified Line 1\n")
-
     # Run the server
     mcp.run(transport="stdio")
