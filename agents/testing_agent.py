@@ -1,4 +1,5 @@
 # Adithya Vardhan 32956089
+# Daniel Rivas 55919944
 import os
 import json
 import asyncio
@@ -12,9 +13,6 @@ from utils.logger import get_logger
 
 # LangChain imports
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.prompts import PromptTemplate
-from langchain_mcp_adapters.tools import load_mcp_tools
 
 # Load environment variables
 load_dotenv()
@@ -45,52 +43,6 @@ class TestingAgent:
             command="python",
             args=[os.getenv("FILE_MCP_PATH", "run_mcp_servers.py"), "file"],
             env=None
-        )
-    
-    async def setup_agent(self):
-        """Setup the LangChain ReAct agent with MCP tools."""
-        # Load MCP tools from running file server
-        file_tools = await load_mcp_tools(self.file_session)
-        
-        # Create ReAct prompt template
-        react_prompt = PromptTemplate.from_template(
-            """You are a testing agent that validates code and generates tests.
-You have access to file manipulation tools.
-
-Available tools:
-{tools}
-
-Tool names: {tool_names}
-
-Use the following format:
-
-Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
-
-Question: {input}
-
-{agent_scratchpad}"""
-        )
-        
-        # Create ReAct agent
-        agent = create_react_agent(
-            llm=self.llm,
-            tools=file_tools,
-            prompt=react_prompt
-        )
-        
-        self.agent_executor = AgentExecutor(
-            agent=agent,
-            tools=file_tools,
-            verbose=True,
-            max_iterations=15,
-            handle_parsing_errors=True
         )
     
     def run_lint_check(self, file_path: str) -> Dict:
@@ -444,8 +396,7 @@ Question: {input}
                 await file_session.initialize()
                 
                 
-                # Load MCP tools
-                await load_mcp_tools(self.file_session)
+
                 
                 results = {}
                 
