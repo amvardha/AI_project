@@ -153,7 +153,10 @@ Question: {input}
             List of task dictionaries
         """
         prompt = f"""
-        You are a software architect. Given the following requirements, break them down into specific, actionable coding tasks.
+        You are a software architect. Given the following requirements, break them down into specific, actionable coding tasks. when planning tasks,
+        consider the following:
+         - always provide the file path that the task should create/modify
+         - do not have redundant functionalities. If there is a file running the backend functionality, do not create another file for the same functionality
         
         Requirements:
         {requirements}
